@@ -411,10 +411,15 @@ def evaluate(
             requests[reqtype].append(instance)
 
         if lm.world_size > 1:
-            instances_rnk = torch.tensor(len(task._instances), device=lm.device)
-            gathered_item = (
-                lm.accelerator.gather(instances_rnk).cpu().detach().numpy().tolist()
-            )
+            local_data = torch.tensor(len(task._instances), device=lm.device) 
+
+            # Prepare a list to receive the gathered tensors
+            gathered_tensor = [torch.zeros_like(local_data) for _ in range(lm.world_size)]
+
+            # Perform the all_gather operation
+            torch.distributed.all_gather(gathered_tensor, local_data)
+            gathered_item = gathered_tensor
+
             # "multiple_choice" task types dispatch (several) "loglikelihood" request types
             reqtype = (
                 "loglikelihood"
@@ -447,10 +452,11 @@ def evaluate(
             req.resps.append(x)
 
         if lm.world_size > 1:
-            lm.accelerator.wait_for_everyone()
+            torch.distributed.barrier()
 
-    RANK = lm.rank
-    WORLD_SIZE = lm.world_size
+    RANK = torch.distributed.get_rank() #lm.rank
+    WORLD_SIZE = torch.distributed.get_world_size() #lm.world_size
+
     ### Postprocess outputs ###
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for task_output in eval_tasks:
@@ -470,7 +476,7 @@ def evaluate(
         # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps.keys():
             doc_iterator = task.doc_iterator(
-                rank=RANK, limit=limit, world_size=WORLD_SIZE
+                rank=lm.rank, limit=limit, world_size=lm.world_size
             )
             for doc_id, doc in doc_iterator:
                 requests = instances_by_doc_id[doc_id]
@@ -510,27 +516,31 @@ def evaluate(
         for task_output in eval_tasks:
             if log_samples:
                 # for task_name, task_samples in list(samples.items()):
-                full_samples = [None] * WORLD_SIZE if RANK == 0 else None
-                torch.distributed.gather_object(
-                    obj=task_output.logged_samples,
-                    object_gather_list=full_samples,
-                    dst=0,
+                full_samples = [None] * WORLD_SIZE  #if RANK == 0 else None
+                torch.distributed.all_gather_object(
+                    full_samples,
+                    task_output.logged_samples,
                 )
 
                 if RANK == 0:
                     task_output.logged_samples = list(
                         itertools.chain.from_iterable(full_samples)
                     )
-
+            #print('here', torch.distributed.get_rank(), task_output.sample_metrics)
             # then collect metrics across all ranks
             for metrics in task_output.sample_metrics:
-                metric_list = [None] * WORLD_SIZE if RANK == 0 else None
-                torch.distributed.gather_object(
-                    obj=task_output.sample_metrics[metrics],
-                    object_gather_list=metric_list,
-                    dst=0,
+                metric_list = [None] * WORLD_SIZE
+                torch.distributed.all_gather_object(
+                    metric_list,
+                    task_output.sample_metrics[metrics],
                 )
+
                 if RANK == 0:
+                    # DP is always the outermost group, so just take one of each DP group instead of 
+                    # having overlaps in our results
+                    DP_STEP_SIZE = WORLD_SIZE // lm.world_size
+                    metric_list = metric_list[::DP_STEP_SIZE]
+
                     task_output.sample_metrics[metrics] = list(
                         itertools.chain.from_iterable(metric_list)
                     )
