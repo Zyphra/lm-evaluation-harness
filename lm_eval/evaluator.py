@@ -130,6 +130,9 @@ def simple_evaluate(
     eval_logger.setLevel(getattr(logging, f"{verbosity}"))
     start_date = time.time()
 
+    RANK = torch.distributed.get_rank()
+    WORLD_SIZE = torch.distributed.get_world_size()
+
     if delete_requests_cache:
         eval_logger.info("Deleting requests cache...")
         delete_cache()
@@ -289,7 +292,7 @@ def simple_evaluate(
         verbosity=verbosity,
     )
 
-    if lm.rank == 0:
+    if RANK == 0:
         if isinstance(model, str):
             model_name = model
         elif hasattr(model, "config") and hasattr(model.config, "_name_or_path"):
